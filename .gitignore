@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.mypi/
+intro.txt
+test_output.txt

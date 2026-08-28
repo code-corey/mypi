@@ -1,0 +1,17 @@
+{
+  "providers": {
+    "autodlgpu": {
+      "baseUrl": "http://localhost:8000/v1",
+      "apiKey": "EMPTY",
+      "api": "openai",
+      "model": "gemma-4-12b"
+    },
+    "glm": {
+      "baseUrl": "http://172.16.248.56:8715",
+      "apiKey": "sk-替换成你的key",
+      "api": "anthropic",
+      "model": "glm-5.2"
+    }
+  },
+  "defaultProvider": "autodlgpu"
+}

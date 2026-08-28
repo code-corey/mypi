@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""MyPi —— 最简命令行编码智能体（模仿 Pi 的核心功能）
+
+用法：
+    python mypi.py                     交互 REPL
+    python mypi.py "帮我写个脚本"       单次任务
+    python mypi.py --provider glm     指定供应商
+    python mypi.py --model xxx        指定模型
+
+配置：~/.mypi/config.json（首次运行自动生成示例）
+"""
+import argparse
+import json
+import os
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001
+    pass
+
+from tools import TOOL_SCHEMAS, execute_tool  # noqa: E402
+
+CONFIG_PATH = os.path.expanduser("~/.mypi/config.json")
+MAX_ROUNDS = 30          # 单次任务最多工具循环轮数
+PROTOCOL_TIMEOUT = 300   # LLM 请求超时（秒）
+
+DEFAULT_CONFIG = {
+    "providers": {
+        "autodlgpu": {
+            "baseUrl": "http://localhost:8000/v1",
+            "apiKey": "EMPTY",
+            "api": "openai",
+            "model": "gemma-4-12b",
+        },
+        "glm": {
+            "baseUrl": "http://172.16.248.56:8715",
+            "apiKey": "sk-替换成你的key",
+            "api": "anthropic",
+            "model": "glm-5.2",
+        },
+    },
+    "defaultProvider": "autodlgpu",
+}
+
+SYSTEM_PROMPT = """你是 MyPi，一个运行在命令行里的极简编码智能体。
+
+能力：通过工具读写文件、执行 shell 命令、联网搜索与浏览网页。
+当前工作目录：{cwd}
+
+原则：
+1. 需要本地信息或操作文件时，主动调用工具，不要凭空猜测
+2. 需要最新信息（新闻/文档/版本号）时，用 web_search 搜索，必要时 web_fetch 阅读原文
+3. 回答用中文，简洁直接；执行破坏性命令前必须先向用户确认
+4. 完成任务后给出简短总结"""
+
+
+# ================================================================ 配置
+def load_config(create: bool = True) -> dict:
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if not create:
+        sys.exit(f"[MyPi] 配置不存在: {CONFIG_PATH}")
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+    print(f"[MyPi] 已生成示例配置: {CONFIG_PATH}")
+    print("[MyPi] 请编辑其中的 apiKey / baseUrl 后重新运行；"
+          "本次将以示例配置继续尝试。\n")
+    return json.loads(json.dumps(DEFAULT_CONFIG))
+
+
+# ================================================================ LLM 客户端
+class LLMError(Exception):
+    pass
+
+
+def _post(url: str, headers: dict, body: dict) -> dict:
+    import requests
+    try:
+        r = requests.post(url, headers=headers, json=body,
+                          timeout=PROTOCOL_TIMEOUT)
+    except requests.exceptions.ConnectionError:
+        raise LLMError(f"无法连接 {url} —— 检查服务是否启动、"
+                       f"baseUrl 是否正确、SSH 隧道是否开启")
+    except requests.exceptions.Timeout:
+        raise LLMError(f"请求超时（{PROTOCOL_TIMEOUT}s）: {url}")
+    if r.status_code >= 400:
+        raise LLMError(f"HTTP {r.status_code}: {r.text[:500]}")
+    return r.json()
+
+
+def chat_openai(base_url: str, api_key: str, model: str,
+                messages: list) -> dict:
+    """OpenAI 协议。返回统一结构 {text, tool_calls:[{id,name,args}]}"""
+    url = base_url.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        url += "/chat/completions"
+    data = _post(url, {"Authorization": f"Bearer {api_key}",
+                       "Content-Type": "application/json"},
+                 {"model": model, "messages": messages, "tools": TOOL_SCHEMAS})
+    msg = data["choices"][0]["message"]
+    calls = []
+    for c in msg.get("tool_calls") or []:
+        fn = c.get("function", {})
+        raw = fn.get("arguments", "{}")
+        try:
+            args = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            args = {"command": str(raw)}
+        calls.append({"id": c.get("id", f"call_{len(calls)}"),
+                      "name": fn.get("name", ""), "args": args})
+    return {"text": msg.get("content"), "tool_calls": calls}
+
+
+def chat_anthropic(base_url: str, api_key: str, model: str,
+                   messages: list) -> dict:
+    """Anthropic 协议。messages 为内部统一格式，在此做转换。"""
+    url = base_url.rstrip("/")
+    if url.endswith("/chat/completions"):
+        url = url[: -len("/chat/completions")]
+    if not url.endswith("/v1/messages"):
+        url += "/v1/messages"
+
+    system = ""
+    conv = []
+    pending_calls = {}  # tool_call_id -> (name, args) 供 tool 消息配对
+    for m in messages:
+        role, content = m["role"], m.get("content")
+        if role == "system":
+            system = content if isinstance(content, str) else str(content)
+        elif role == "user":
+            conv.append({"role": "user", "content": content})
+        elif role == "assistant":
+            blocks = []
+            if content:
+                blocks.append({"type": "text", "text": content})
+            for c in m.get("_tool_calls", []):
+                blocks.append({"type": "tool_use", "id": c["id"],
+                               "name": c["name"],
+                               "input": c["args"]})
+                pending_calls[c["id"]] = c
+            conv.append({"role": "assistant", "content": blocks})
+        elif role == "tool":
+            tr_id = m.get("tool_call_id", "")
+            conv.append({"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": tr_id,
+                "content": str(content)}]})
+
+    tools = [{"name": t["function"]["name"],
+              "description": t["function"]["description"],
+              "input_schema": t["function"]["parameters"]}
+             for t in TOOL_SCHEMAS]
+
+    data = _post(url, {"x-api-key": api_key,
+                       "anthropic-version": "2023-06-01",
+                       "Content-Type": "application/json"},
+                 {"model": model, "max_tokens": 8192,
+                  "system": system, "messages": conv, "tools": tools})
+
+    text, calls = "", []
+    for b in data.get("content", []):
+        if b.get("type") == "text":
+            text += b.get("text", "")
+        elif b.get("type") == "tool_use":
+            calls.append({"id": b.get("id", ""), "name": b.get("name", ""),
+                          "args": b.get("input", {})})
+    return {"text": text or None, "tool_calls": calls}
+
+
+def chat(provider: dict, model: str, messages: list) -> dict:
+    api = provider.get("api", "openai")
+    if api == "anthropic":
+        return chat_anthropic(provider["baseUrl"], provider.get("apiKey", ""),
+                              model, messages)
+    return chat_openai(provider["baseUrl"], provider.get("apiKey", ""),
+                       model, messages)
+
+
+# ================================================================ Agent 循环
+def run_task(provider: dict, model: str, task: str, history: list) -> list:
+    """执行一次用户任务（可多轮工具循环），返回更新后的 history。"""
+    if not history:
+        history.append({"role": "system",
+                        "content": SYSTEM_PROMPT.format(cwd=os.getcwd())})
+    history.append({"role": "user", "content": task})
+
+    for _round in range(MAX_ROUNDS):
+        try:
+            resp = chat(provider, model, history)
+        except LLMError as e:
+            print(f"\n[MyPi] 请求失败：{e}")
+            return history
+
+        text, calls = resp["text"], resp["tool_calls"]
+
+        if calls:
+            for c in calls:
+                arg_preview = json.dumps(c["args"], ensure_ascii=False)
+                if len(arg_preview) > 80:
+                    arg_preview = arg_preview[:80] + "…"
+                print(f"  🔧 {c['name']}({arg_preview})")
+            # 记录 assistant 消息（含 tool_calls 元信息，anthropic 转换时用）
+            a_msg = {"role": "assistant", "content": text,
+                     "_tool_calls": calls}
+            history.append(a_msg)
+            if text:
+                print(f"\n{text}\n")
+            # 执行并回填结果
+            for c in calls:
+                result = execute_tool(c["name"], c["args"])
+                print(f"  └─ {result[:100].replace(chr(10), ' ⏎ ')}"
+                      + ("…" if len(result) > 100 else ""))
+                history.append({"role": "tool", "tool_call_id": c["id"],
+                                "content": result})
+            continue  # 继续循环，让模型基于工具结果继续
+
+        # 无工具调用 → 最终回答
+        print(f"\n{text}\n")
+        return history
+
+    print(f"\n[MyPi] 已达最大循环轮数（{MAX_ROUNDS}），强制结束本轮任务。")
+    return history
+
+
+# ================================================================ CLI / REPL
+BANNER = """
+══════════════════════════════════════════
+  MyPi · 最简命令行编码智能体
+  工具: bash · 文件读写 · web_fetch · web_search
+  命令: /help 查看 | /exit 退出
+══════════════════════════════════════════"""
+
+
+def resolve(cfg, args) -> tuple:
+    pname = args.provider or cfg.get("defaultProvider")
+    providers = cfg.get("providers", {})
+    if pname not in providers:
+        sys.exit(f"[MyPi] 供应商 '{pname}' 不存在。可用: {', '.join(providers)}")
+    p = providers[pname]
+    model = args.model or p.get("model")
+    if not model:
+        sys.exit(f"[MyPi] 供应商 '{pname}' 未配置 model，请用 --model 指定")
+    return pname, p, model
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="mypi",
+                                 description="MyPi · 最简命令行编码智能体")
+    ap.add_argument("task", nargs="*", help="一次性任务（不进入 REPL）")
+    ap.add_argument("--provider", help="供应商名（config 里的 key）")
+    ap.add_argument("--model", help="模型 ID（覆盖配置）")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    pname, provider, model = resolve(cfg, args)
+
+    print(f"[MyPi] 供应商={pname}  模型={model}  协议={provider.get('api')}"
+          f"  端点={provider['baseUrl']}")
+
+    if args.task:
+        run_task(provider, model, " ".join(args.task), [])
+        return
+
+    # REPL
+    print(BANNER)
+    history = []
+    while True:
+        try:
+            line = input("\n你 > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n再见！")
+            break
+        if not line:
+            continue
+        if line in ("/exit", "/quit", "exit", "quit"):
+            print("再见！")
+            break
+        if line == "/reset":
+            history.clear()
+            print("[MyPi] 对话已清空。")
+            continue
+        if line == "/help":
+            print("""命令:
+  /reset            清空对话历史
+  /provider [名称]   查看或切换供应商
+  /model [名称]      查看或切换模型
+  /tools            列出可用工具
+  /exit             退出
+其他输入都会作为任务发给模型（可多轮工具调用）。""")
+            continue
+        if line == "/tools":
+            for t in TOOL_SCHEMAS:
+                fn = t["function"]
+                print(f"  {fn['name']:12s} {fn['description']}")
+            continue
+        if line.startswith("/provider"):
+            parts = line.split(maxsplit=1)
+            if len(parts) == 2 and parts[1] in cfg["providers"]:
+                pname, provider = parts[1], cfg["providers"][parts[1]]
+                model = provider.get("model", model)
+                print(f"[MyPi] 已切换到 {pname} / {model}")
+            else:
+                print(f"可用供应商: {', '.join(cfg['providers'])}"
+                      f"（当前 {pname}）")
+            continue
+        if line.startswith("/model"):
+            parts = line.split(maxsplit=1)
+            if len(parts) == 2:
+                model = parts[1]
+                print(f"[MyPi] 模型已切换为 {model}")
+            else:
+                print(f"当前模型: {model}")
+            continue
+
+        history = run_task(provider, model, line, history)
+
+
+if __name__ == "__main__":
+    main()
