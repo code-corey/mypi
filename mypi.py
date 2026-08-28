@@ -24,10 +24,11 @@ except Exception:  # noqa: BLE001
 from tools import TOOL_SCHEMAS, execute_tool  # noqa: E402
 
 CONFIG_PATH = os.path.expanduser("~/.mypi/config.json")
-MAX_ROUNDS = 30          # 单次任务最多工具循环轮数
 PROTOCOL_TIMEOUT = 300   # LLM 请求超时（秒）
+# 循环轮数上限改为配置项 maxRounds（cfg 里），0 = 不限制
 
 DEFAULT_CONFIG = {
+    "maxRounds": 0,
     "providers": {
         "autodlgpu": {
             "baseUrl": "http://localhost:8000/v1",
@@ -181,14 +182,22 @@ def chat(provider: dict, model: str, messages: list) -> dict:
 
 
 # ================================================================ Agent 循环
-def run_task(provider: dict, model: str, task: str, history: list) -> list:
-    """执行一次用户任务（可多轮工具循环），返回更新后的 history。"""
+def run_task(provider: dict, model: str, task: str, history: list,
+             max_rounds: int = 0) -> list:
+    """执行一次用户任务（可多轮工具循环），返回更新后的 history。
+    max_rounds: 循环轮数上限，0 = 不限制。"""
     if not history:
         history.append({"role": "system",
                         "content": SYSTEM_PROMPT.format(cwd=os.getcwd())})
     history.append({"role": "user", "content": task})
 
-    for _round in range(MAX_ROUNDS):
+    rounds = 0
+    while True:
+        if max_rounds and rounds >= max_rounds:
+            print(f"\n[MyPi] 已达最大循环轮数（{max_rounds}），强制结束本轮任务。"
+                  f"可在配置中调大 maxRounds 或设为 0（不限制）。")
+            return history
+        rounds += 1
         try:
             resp = chat(provider, model, history)
         except LLMError as e:
@@ -222,8 +231,7 @@ def run_task(provider: dict, model: str, task: str, history: list) -> list:
         print(f"\n{text}\n")
         return history
 
-    print(f"\n[MyPi] 已达最大循环轮数（{MAX_ROUNDS}），强制结束本轮任务。")
-    return history
+    # max_rounds 为 0 时永远不会到达这里（while True 由 return 退出）
 
 
 # ================================================================ CLI / REPL
@@ -257,12 +265,14 @@ def main() -> None:
 
     cfg = load_config()
     pname, provider, model = resolve(cfg, args)
+    max_rounds = int(cfg.get("maxRounds", 0) or 0)
 
     print(f"[MyPi] 供应商={pname}  模型={model}  协议={provider.get('api')}"
           f"  端点={provider['baseUrl']}")
 
     if args.task:
-        run_task(provider, model, " ".join(args.task), [])
+        run_task(provider, model, " ".join(args.task), [],
+                 max_rounds=max_rounds)
         return
 
     # REPL
@@ -316,7 +326,8 @@ def main() -> None:
                 print(f"当前模型: {model}")
             continue
 
-        history = run_task(provider, model, line, history)
+        history = run_task(provider, model, line, history,
+                           max_rounds=max_rounds)
 
 
 if __name__ == "__main__":

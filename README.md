@@ -57,6 +57,7 @@ mypi --provider glm     # 切换供应商
 
 ```json
 {
+  "maxRounds": 0,
   "providers": {
     "autodlgpu": {
       "baseUrl": "http://localhost:8000/v1",   // OpenAI 协议端点（vLLM）
@@ -74,6 +75,8 @@ mypi --provider glm     # 切换供应商
   "defaultProvider": "autodlgpu"
 }
 ```
+
+- **maxRounds**：单次任务的工具循环轮数上限，`0` = 不限制（默认）。设正数可在模型陷入循环时自动刹车
 
 - **api 字段**决定请求格式：`openai` 走 `/chat/completions` + `tools`；`anthropic` 走 `/v1/messages` + `tool_use/tool_result`
 - baseUrl 不要重复写 `/v1` 以外的路径，代码会自动拼接
