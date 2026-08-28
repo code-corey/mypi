@@ -13,17 +13,33 @@
 import argparse
 import json
 import os
+import re
 import sys
+import time
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stdin and sys.stdin.isatty() is False:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # 管道输入中文
 except Exception:  # noqa: BLE001
     pass
 
-from tools import TOOL_SCHEMAS, execute_tool  # noqa: E402
+from tools import TOOL_SCHEMAS, execute_tool, MEMORY_FILE  # noqa: E402
+
+# ---- 富终端输出（rich 可选，未安装时自动降级纯文本）----
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+    console = Console()
+    HAS_RICH = True
+except ImportError:
+    console = None
+    HAS_RICH = False
 
 CONFIG_PATH = os.path.expanduser("~/.mypi/config.json")
+SESSIONS_DIR = os.path.expanduser("~/.mypi/sessions")
 PROTOCOL_TIMEOUT = 300   # LLM 请求超时（秒）
 # 循环轮数上限改为配置项 maxRounds（cfg 里），0 = 不限制
 
@@ -54,8 +70,100 @@ SYSTEM_PROMPT = """你是 MyPi，一个运行在命令行里的极简编码智�
 原则：
 1. 需要本地信息或操作文件时，主动调用工具，不要凭空猜测
 2. 需要最新信息（新闻/文档/版本号）时，用 web_search 搜索，必要时 web_fetch 阅读原文
-3. 回答用中文，简洁直接；执行破坏性命令前必须先向用户确认
+3. 回答用中文，简洁自然，像结对工程师对话；完成任务后简短总结即可，不要每次都长篇报告，用户追问时直接回应
 4. 完成任务后给出简短总结"""
+
+
+def build_system_prompt() -> str:
+    """系统提示词 + 跨会话记忆注入"""
+    prompt = SYSTEM_PROMPT.format(cwd=os.getcwd())
+    if os.path.exists(MEMORY_FILE):
+        mem = open(MEMORY_FILE, encoding="utf-8").read().strip()
+        if mem:
+            if len(mem) > 4000:
+                mem = mem[:4000] + "\n...[截断]"
+            prompt += (f"\n\n【长期记忆】以下是往期会话积累的记忆（memory 工具存档）：\n"
+                       f"<memory>\n{mem}\n</memory>\n"
+                       "对话中出现值得长期记住的信息（用户偏好、项目背景、重要决定）时，"
+                       "调用 memory 工具(action=save)追加记录。")
+    return prompt
+
+
+# ================================================================ 输出层
+def show_assistant(text: str):
+    if not text:
+        return
+    if HAS_RICH:
+        console.print(Panel(Markdown(text), title="MyPi", title_align="left",
+                            border_style="cyan", padding=(0, 1)))
+    else:
+        print(f"\n{text}\n")
+
+
+def show_tool_call(name: str, args: dict):
+    preview = json.dumps(args, ensure_ascii=False)
+    if len(preview) > 80:
+        preview = preview[:80] + "…"
+    if HAS_RICH:
+        console.print(f"  [yellow]🔧 {name}[/][dim]({preview})[/]")
+    else:
+        print(f"  🔧 {name}({preview})")
+
+
+def show_tool_result(result: str):
+    one = result[:100].replace("\n", " ⏎ ") + ("…" if len(result) > 100 else "")
+    if HAS_RICH:
+        console.print(f"  [dim]└─ {one}[/]")
+    else:
+        print(f"  └─ {one}")
+
+
+def spinner(text: str):
+    import contextlib
+    if HAS_RICH:
+        return console.status(f"[cyan]{text}[/]")
+    return contextlib.nullcontext()
+
+
+def ask_prompt() -> str:
+    if HAS_RICH and sys.stdin.isatty():
+        return console.input("[bold green]你 > [/]")
+    return input("你 > ")
+
+
+# ================================================================ 会话持久化
+def save_session(history: list, pname: str = "", model: str = ""):
+    msgs = [m for m in history if m["role"] != "system"]
+    if not msgs:
+        return None
+    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    first = next((str(m.get("content"))[:30] for m in history
+                  if m["role"] == "user"), "session")
+    slug = re.sub(r'[\\/:*?"<>|\s]+', "_", first)
+    path = os.path.join(SESSIONS_DIR, f"{ts}_{slug}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        # ensure_ascii=True：非 ASCII 全部转义，彻底免疫代理字符/编码问题
+        json.dump({"created": ts, "provider": pname, "model": model,
+                   "history": history}, f, ensure_ascii=True, indent=2)
+    return path
+
+
+def list_sessions() -> list:
+    if not os.path.isdir(SESSIONS_DIR):
+        return []
+    return [os.path.join(SESSIONS_DIR, n) for n in sorted(os.listdir(SESSIONS_DIR))
+            if n.endswith(".json")]
+
+
+def load_session(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("history", []), data.get("provider", ""), data.get("model", "")
+    except Exception as e:  # noqa: BLE001
+        print(f"[MyPi] 会话文件损坏，跳过: {e}")
+        return [], "", ""
 
 
 # ================================================================ 配置
@@ -187,8 +295,7 @@ def run_task(provider: dict, model: str, task: str, history: list,
     """执行一次用户任务（可多轮工具循环），返回更新后的 history。
     max_rounds: 循环轮数上限，0 = 不限制。"""
     if not history:
-        history.append({"role": "system",
-                        "content": SYSTEM_PROMPT.format(cwd=os.getcwd())})
+        history.append({"role": "system", "content": build_system_prompt()})
     history.append({"role": "user", "content": task})
 
     rounds = 0
@@ -238,7 +345,8 @@ def run_task(provider: dict, model: str, task: str, history: list,
 BANNER = """
 ══════════════════════════════════════════
   MyPi · 最简命令行编码智能体
-  工具: bash · 文件读写 · web_fetch · web_search
+  工具: bash · 文件读写 · web_fetch · web_search · memory
+  会话自动保存 ~/.mypi/sessions/ · 记忆 ~/.mypi/memory.md
   命令: /help 查看 | /exit 退出
 ══════════════════════════════════════════"""
 
@@ -255,38 +363,24 @@ def resolve(cfg, args) -> tuple:
     return pname, p, model
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(prog="mypi",
-                                 description="MyPi · 最简命令行编码智能体")
-    ap.add_argument("task", nargs="*", help="一次性任务（不进入 REPL）")
-    ap.add_argument("--provider", help="供应商名（config 里的 key）")
-    ap.add_argument("--model", help="模型 ID（覆盖配置）")
-    args = ap.parse_args()
-
-    cfg = load_config()
-    pname, provider, model = resolve(cfg, args)
-    max_rounds = int(cfg.get("maxRounds", 0) or 0)
-
-    print(f"[MyPi] 供应商={pname}  模型={model}  协议={provider.get('api')}"
-          f"  端点={provider['baseUrl']}")
-
-    if args.task:
-        run_task(provider, model, " ".join(args.task), [],
-                 max_rounds=max_rounds)
-        return
-
-    # REPL
+def repl_loop(cfg, pname, provider, model, history, max_rounds):
+    """交互对话主循环（自动存档）"""
     print(BANNER)
-    history = []
     while True:
         try:
-            line = input("\n你 > ").strip()
+            line = ask_prompt().strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n再见！")
+            path = save_session(history, pname, model)
+            if path:
+                print(f"\n💾 会话已保存: {os.path.basename(path)}")
+            print("再见！")
             break
         if not line:
             continue
         if line in ("/exit", "/quit", "exit", "quit"):
+            path = save_session(history, pname, model)
+            if path:
+                print(f"💾 会话已保存: {os.path.basename(path)}")
             print("再见！")
             break
         if line == "/reset":
@@ -296,11 +390,43 @@ def main() -> None:
         if line == "/help":
             print("""命令:
   /reset            清空对话历史
+  /save             手动保存会话
+  /sessions         列出历史会话
+  /load <序号>       恢复指定会话（1=最近）
   /provider [名称]   查看或切换供应商
   /model [名称]      查看或切换模型
   /tools            列出可用工具
-  /exit             退出
+  /exit             退出（自动保存）
 其他输入都会作为任务发给模型（可多轮工具调用）。""")
+            continue
+        if line == "/save":
+            path = save_session(history, pname, model)
+            print(f"💾 {path}" if path else "[MyPi] 没有可保存的内容")
+            continue
+        if line == "/sessions":
+            sessions = list_sessions()
+            if not sessions:
+                print("(没有历史会话)")
+            for i, s in enumerate(reversed(sessions), 1):
+                print(f"  {i}. {os.path.basename(s)}")
+            continue
+        if line.startswith("/load"):
+            parts = line.split(maxsplit=1)
+            sessions = list_sessions()
+            if len(parts) < 2 or not parts[1].isdigit():
+                print("用法: /load <序号>（/sessions 查看，1=最近）")
+                continue
+            idx = len(sessions) - int(parts[1])
+            if not (0 <= idx < len(sessions)):
+                print("序号超出范围")
+                continue
+            history, sp, sm = load_session(sessions[idx])
+            if sp and sp in cfg["providers"]:
+                pname, provider = sp, cfg["providers"][sp]
+            if sm:
+                model = sm
+            print(f"[MyPi] 已恢复会话（{len(history)} 条消息）："
+                  f"{os.path.basename(sessions[idx])}")
             continue
         if line == "/tools":
             for t in TOOL_SCHEMAS:
@@ -328,6 +454,60 @@ def main() -> None:
 
         history = run_task(provider, model, line, history,
                            max_rounds=max_rounds)
+        path = save_session(history, pname, model)
+        if path:
+            print(f"  💾 {os.path.basename(path)}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="mypi",
+                                 description="MyPi · 最简命令行编码智能体")
+    ap.add_argument("task", nargs="*",
+                    help="任务（交互终端下完成后自动进入连续对话）")
+    ap.add_argument("--provider", help="供应商名（config 里的 key）")
+    ap.add_argument("--model", help="模型 ID（覆盖配置）")
+    ap.add_argument("-c", "--continue", dest="cont", action="store_true",
+                    help="继续最近一次会话")
+    ap.add_argument("--no-chat", dest="no_chat", action="store_true",
+                    help="任务完成后直接退出，不进入连续对话")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    pname, provider, model = resolve(cfg, args)
+    max_rounds = int(cfg.get("maxRounds", 0) or 0)
+
+    if HAS_RICH:
+        console.print(f"[dim][MyPi] 供应商={pname}  模型={model}  "
+                      f"协议={provider.get('api')}  端点={provider['baseUrl']}[/]")
+    else:
+        print(f"[MyPi] 供应商={pname}  模型={model}  协议={provider.get('api')}"
+              f"  端点={provider['baseUrl']}")
+
+    history = []
+    if args.cont:
+        sessions = list_sessions()
+        if sessions:
+            history, sp, sm = load_session(sessions[-1])
+            if sp and sp in cfg["providers"]:
+                pname, provider = sp, cfg["providers"][sp]
+            if sm:
+                model = sm
+            msg = f"[MyPi] 已恢复最近会话（{len(history)} 条消息）"
+            console.print(f"[dim]{msg}[/]") if HAS_RICH else print(msg)
+        else:
+            print("[MyPi] 没有历史会话，从头开始。")
+
+    if args.task:
+        history = run_task(provider, model, " ".join(args.task), history,
+                           max_rounds=max_rounds)
+        path = save_session(history, pname, model)
+        if path:
+            print(f"  💾 {os.path.basename(path)}")
+        if args.no_chat or not sys.stdin.isatty():
+            return  # 脚本/管道场景：直接退出
+        print("（已进入连续对话，/exit 退出）")
+
+    repl_loop(cfg, pname, provider, model, history, max_rounds)
 
 
 if __name__ == "__main__":

@@ -15,9 +15,12 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 from urllib.parse import quote, unquote, parse_qs, urlparse
 
 import requests
+
+MEMORY_FILE = os.path.expanduser("~/.mypi/memory.md")   # 跨会话记忆文件
 
 MAX_OUTPUT = 6000        # bash 输出截断
 MAX_FILE = 10000         # 单文件读取截断
@@ -217,6 +220,31 @@ def _web_search(args: dict) -> str:
         return f"Error: {e}"
 
 
+def _memory(args: dict) -> str:
+    """长期记忆：save 追加一条 / read 全部读取 / clear 清空"""
+    action = (args.get("action") or "read").strip().lower()
+    os.makedirs(os.path.dirname(MEMORY_FILE), exist_ok=True)
+    if action == "save":
+        content = (args.get("content") or "").strip()
+        if not content:
+            return "Error: save 需要 content 参数"
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with open(MEMORY_FILE, "a", encoding="utf-8") as f:
+            f.write(f"- [{stamp}] {content}\n")
+        n = sum(1 for _ in open(MEMORY_FILE, encoding="utf-8"))
+        return f"OK: 已记住（记忆共 {n} 条）"
+    if action == "clear":
+        open(MEMORY_FILE, "w", encoding="utf-8").close()
+        return "OK: 记忆已清空"
+    # 默认 read
+    if os.path.exists(MEMORY_FILE):
+        data = open(MEMORY_FILE, encoding="utf-8").read().strip()
+        if len(data) > 6000:
+            data = data[:6000] + "\n...[截断]"
+        return data or "(记忆为空)"
+    return "(记忆为空)"
+
+
 # ---------------------------------------------------------------- 分发表
 _DISPATCH = {
     "bash": _bash,
@@ -226,6 +254,7 @@ _DISPATCH = {
     "list_dir": _list_dir,
     "web_fetch": _web_fetch,
     "web_search": _web_search,
+    "memory": _memory,
 }
 
 
@@ -276,6 +305,12 @@ _TOOL_DEFS = [
          "query": {"type": "string", "description": "搜索关键词"},
          "max_results": {"type": "integer", "description": "返回条数，默认5"}},
       "required": ["query"]}),
+    ("memory", "跨会话长期记忆：save 追加一条值得记住的信息（用户偏好/项目背景/重要决定）；read 读取全部记忆；clear 清空",
+     {"type": "object", "properties": {
+         "action": {"type": "string", "enum": ["save", "read", "clear"],
+                     "description": "操作类型"},
+         "content": {"type": "string", "description": "要记住的内容（action=save 时必填）"}},
+      "required": ["action"]}),
 ]
 
 TOOL_SCHEMAS = [
