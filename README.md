@@ -8,16 +8,20 @@
 |---|---|
 | ![CLI and tools](docs/screenshots/01-cli-and-tools.png) | ![Agent web task](docs/screenshots/02-agent-task-web.png) |
 
-| 全局命令 + bash 工具 |
-|---|
-| ![Global command](docs/screenshots/03-global-command-bash.png) |
+| 全局命令 + bash 工具 | 会话恢复 + 跨会话记忆（v0.3） |
+|---|---|
+| ![Global command](docs/screenshots/03-global-command-bash.png) | ![Sessions & memory](docs/screenshots/03-sessions-memory.png) |
 
 
 ## ✨ 功能
 
-- 🔄 **Agent 循环**：模型可多轮调用工具，直到完成任务
+- 🔄 **Agent 循环**：模型可多轮调用工具，直到完成任务；`maxRounds` 可配（0=不限制）
+- 💬 **连续对话**：单次任务跑完后自动进入 REPL 追问（管道/脚本场景不干扰）
+- 💾 **会话持久化**：自动存档 `~/.mypi/sessions/`，`mypi -c` 续聊、`/sessions` `/load` 管理
+- 🧠 **跨会话记忆**：`memory` 工具 + `~/.mypi/memory.md` 自动注入系统提示词
+- 🎨 **rich 富界面**：Markdown 面板 / 加载动画 / 彩色工具行（未安装自动降级纯文本）
 - 🖥️ **双协议**：同时支持 OpenAI（`/chat/completions`）与 Anthropic（`/v1/messages`）协议，vLLM / GLM / 任何兼容端点都能接
-- 🛠️ **7 个内置工具**：
+- 🛠️ **8 个内置工具**：
 
 | 工具 | 说明 |
 |------|------|
@@ -26,6 +30,7 @@
 | `list_dir` | 目录浏览 |
 | `web_fetch` | 抓取网页转纯文本（自动去标签，截断保护） |
 | `web_search` | DuckDuckGo 联网搜索，免 API Key |
+| `memory` | 跨会话长期记忆（save / read / clear，存 `~/.mypi/memory.md`） |
 
 ## 🚀 快速开始
 
@@ -94,11 +99,22 @@ mypi --provider glm     # 切换供应商
 ```
 mypi/
 ├── mypi.py               # 核心：配置加载 + Agent 循环 + 双协议客户端 + REPL
-├── tools.py              # 7 个工具 + TOOL_SCHEMAS + execute_tool()
+├── tools.py              # 8 个工具 + TOOL_SCHEMAS + execute_tool()
 ├── mypi.cmd              # Windows 全局命令包装
 ├── config.example.json   # 配置示例
-└── requirements.txt      # 唯一依赖: requests
+└── requirements.txt      # requests + rich（未装 rich 自动降级纯文本）
 ```
+
+## 💾 会话与记忆
+
+```bash
+mypi -c                    # 继续最近一次会话
+mypi -c --provider glm     # 指定供应商续聊
+```
+
+- 每轮对话自动存档到 `~/.mypi/sessions/`，REPL 里 `/save` `/sessions` `/load <序号>` 管理
+- `~/.mypi/memory.md` 是跨会话记忆文件：会话开始自动注入系统提示词，模型用 `memory` 工具追加
+- 单次任务 `mypi "任务"` 在交互终端下完成后自动进入连续对话；`--no-chat` 或管道场景直接退出
 
 ## 🧠 设计思路（为什么只有两个文件）
 

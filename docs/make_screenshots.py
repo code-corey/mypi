@@ -76,3 +76,33 @@ render(lines, r"D:\develop\mypi\docs\screenshots\02-agent-task-web.png",
        "MyPi - Agent Loop: web_search + write_file", width=1300)
 
 print("ALL_DONE")
+
+# ============ 截图 3: v0.3 会话恢复 + 连续对话 + 记忆 ============
+lines = [("PS D:\develop\mypi> mypi -c --provider glm     # -c 恢复最近会话", GREEN)]
+lines.append(("[MyPi] 供应商=glm  模型=glm-5.2  协议=anthropic  端点=http://172.16.248.56:8715", CYAN))
+lines.append(("[MyPi] 已恢复最近会话（2 条消息）", CYAN))
+lines.append(("", FG))
+lines.append(("  MyPi · 最简命令行编码智能体", PURPLE))
+lines.append(("  工具: bash · 文件读写 · web_fetch · web_search · memory", PURPLE))
+lines.append(("  会话自动保存 ~/.mypi/sessions/ · 记忆 ~/.mypi/memory.md", PURPLE))
+lines.append(("", FG))
+lines.append(("你 > 刚才那个任务用到了几个工具？第一次失败后是怎么自救的？", GREEN))
+lines.append(("╭─ MyPi ─────────────────────────────────────────────╮", CYAN))
+lines.append(("│ 只用到了 **1 个工具**：bash，一共调了两次。             │", FG))
+lines.append(("│ 第一次 `ls *.py` 失败——Windows 的 cmd 不认识它。      │", FG))
+lines.append(("│ 我看到 stderr 报错后换了通用写法：                     │", FG))
+lines.append(("│ `find . -maxdepth 1 -name \"*.py\" | xargs wc -l`      │", FG))
+lines.append(("│ 成功统计出 mypi.py 514 行、tools.py 329 行。           │", FG))
+lines.append(("╰────────────────────────────────────────────────────╯", CYAN))
+lines.append(("  💾 20260829-031601_帮我用bash看看当前目录有什么.json", BAR))
+lines.append(("", FG))
+lines.append(("你 > /memory save 用户偏好 Dracula 主题", GREEN))
+lines.append(("  └─ OK: 已记住（记忆共 3 条）", YELLOW))
+lines.append(("", FG))
+lines.append(("你 > （新开的进程）我的偏好是什么？", GREEN))
+lines.append(("╭─ MyPi ─────────────────────────────────────────────╮", CYAN))
+lines.append(("│ 根据长期记忆：你喜欢 **Dracula 主题**。                 │", FG))
+lines.append(("╰────────────────────────────────────────────────────╯", CYAN))
+render(lines, r"D:\develop\mypi\docs\screenshots\03-sessions-memory.png",
+       "MyPi v0.3 - Sessions & Memory", width=1180)
+print("ALL_DONE")
